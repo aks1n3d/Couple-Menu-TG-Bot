@@ -309,6 +309,15 @@ function pemToArrayBuffer(pem) {
     for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
     return arr.buffer;
 }
+function isMember(membersArray, userId) {
+    try { return (membersArray || []).some(x => Number(x) === Number(userId)); }
+    catch { return false; }
+}
+function addMemberSafe(membersArray, userId) {
+    const set = new Set((membersArray || []).map(x => String(x)));
+    set.add(String(userId));
+    return Array.from(set);
+}
 async function gcpAccessToken(env) {
     const iat = Math.floor(Date.now() / 1000), exp = iat + 3600;
     const h = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
@@ -555,11 +564,11 @@ async function ensurePairIntegrity(env, userId) {
     let members = [];
     try { members = JSON.parse(fget(pairDoc, "members", "[]")); } catch { members = []; }
 
-    const hasMe = members.some(x => Number(x) === Number(userId));
+    const hasMe = isMember(members, userId);
     if (hasMe) return { ok:true, userDoc, pairDoc };
 
     if (members.length < 2) {
-        members.push(userId);
+        members = addMemberSafe(members, userId);
         await fsPatch(env, `pairs/${pairCode}`, { members: JSON.stringify(members) });
         pairDoc = await getPairDoc(env, pairCode);
         return { ok:true, userDoc, pairDoc };
@@ -795,7 +804,12 @@ async function handleCreate(env, chatId, fromId, role, ctxMsgId=null) {
     const lang = fget(uDoc, "lang", "ru");
 
     const code = genPairCode();
-    await fsCreate(env, "pairs", code, { code, createdBy: fromId, members: JSON.stringify([fromId]), createdAt: Date.now() });
+    await fsCreate(env, "pairs", code, {
+        code,
+        createdBy: fromId,
+        members: JSON.stringify([Number(fromId)]), // <— ЯВНО как число
+        createdAt: Date.now()
+    });
     await setUser(env, fromId, { telegramId: fromId, pairCode: code, role });
 
     const refBy = fget(uDoc, "refBy", null);
@@ -822,9 +836,9 @@ async function handleJoin(env, chatId, fromId, code, ctxMsgId=null) {
 
     let members = [];
     try { members = JSON.parse(fget(pair, "members", "[]")); } catch { members = []; }
-    if (!members.includes(fromId)) {
+    if (!isMember(members, fromId)) {
         if (members.length >= 2) return uiText(env, chatId, fromId, `Эта пара уже заполнена двумя участниками.`, undefined, lang, ctxMsgId);
-        members.push(fromId);
+        members = addMemberSafe(members, fromId);
         await fsSet(env, `pairs/${code}`, { members: JSON.stringify(members) });
     }
     await setUser(env, fromId, { telegramId: fromId, pairCode: code });
@@ -1318,7 +1332,7 @@ async function handlePairDeleteCancel(env, chatId, fromId, ctxMsgId=null) {
     if (!pendingBy) return uiText(env, chatId, fromId, t(lang,"delpair_nothing_pending"), undefined, lang, ctxMsgId);
 
     let members=[]; try { members = JSON.parse(fget(pair,"members","[]")); } catch {}
-    if (!members.includes(fromId)) return uiText(env, chatId, fromId, t(lang,"delpair_not_member"), undefined, lang, ctxMsgId);
+    if (!isMember(members, fromId)) return uiText(env, chatId, fromId, t(lang,"delpair_not_member"), undefined, lang, ctxMsgId);
 
     await fsPatch(env, `pairs/${pairCode}`, { deleteRequestedBy: 0, deleteRequestedAt: 0 });
 
