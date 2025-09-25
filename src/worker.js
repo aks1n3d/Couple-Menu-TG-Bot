@@ -507,6 +507,112 @@ async function getUser(env, telegramId) { return await fsGet(env, `users/${teleg
 async function setUser(env, telegramId, fields) { return await fsSet(env, `users/${telegramId}`, fields); }
 function botDeepLink(env, payload) { return `https://t.me/${env.BOT_USERNAME}?start=${encodeURIComponent(payload)}`; }
 
+// ───────────────────────────────
+// Pair integrity: авто-починка user↔pair
+// ───────────────────────────────
+
+// 1) гарантируем наличие user-документа и базовых полей
+async function ensureUserDoc(env, userId) {
+    let u = await getUser(env, userId);
+    if (!u || !u.name) {
+        await setUser(env, userId, { telegramId: userId, lang: "ru" });
+        u = await getUser(env, userId);
+    }
+    return u;
+}
+
+/**
+ * 2) ensurePairIntegrity:
+ * - если у юзера есть pairCode, но документа пары нет — создаём заново (auto-recover),
+ * - если есть пара, но в members нет юзера — добавляем его (если есть место),
+ * - если пара забита 2 чужими и вас там нет — возвращаем {conflict:true} (просим подтвердить перепривязку).
+ *
+ * Возвращает:
+ *  { ok:true, userDoc, pairDoc }                — всё хорошо/починили
+ *  { ok:false, reason:"no_pair" }               — у юзера нет pairCode
+ *  { ok:false, reason:"conflict", pairCode }    — пара полна и вы в неё не входите
+ */
+async function ensurePairIntegrity(env, userId) {
+    const userDoc = await ensureUserDoc(env, userId);
+    const pairCode = fget(userDoc, "pairCode", "");
+    if (!pairCode) return { ok:false, reason:"no_pair", userDoc };
+
+    let pairDoc = await getPairDoc(env, pairCode);
+    // авто-восстановление удалённой пары: создадим новый документ пары с тем же кодом
+    if (!pairDoc) {
+        await fsCreate(env, "pairs", pairCode, {
+            code: pairCode,
+            createdBy: userId,
+            members: JSON.stringify([userId]),
+            recoveredAt: Date.now(),
+            createdAt: Date.now()
+        });
+        pairDoc = await getPairDoc(env, pairCode);
+        return { ok:true, userDoc, pairDoc };
+    }
+
+    // проверим members
+    let members = [];
+    try { members = JSON.parse(fget(pairDoc, "members", "[]")); } catch { members = []; }
+
+    const hasMe = members.some(x => Number(x) === Number(userId));
+    if (hasMe) return { ok:true, userDoc, pairDoc };
+
+    if (members.length < 2) {
+        members.push(userId);
+        await fsPatch(env, `pairs/${pairCode}`, { members: JSON.stringify(members) });
+        pairDoc = await getPairDoc(env, pairCode);
+        return { ok:true, userDoc, pairDoc };
+    }
+
+    // конфликт: пара уже занята двумя другими
+    return { ok:false, reason:"conflict", userDoc, pairDoc, pairCode };
+}
+
+// 3) быстрый хелпер для хендлеров: починить и, если надо, показать понятный экран
+async function assertPairOrExplain(env, chatId, userId, ctxMsgId=null) {
+    const res = await ensurePairIntegrity(env, userId);
+    const lang = fget(res.userDoc || {}, "lang", "ru");
+
+    if (res.ok) return res; // всё хорошо — можно продолжать
+
+    if (res.reason === "no_pair") {
+        await uiText(env, chatId, userId,
+            t(lang, "first_start_tip") + `
+
+• /create_boy  /create_girl
+• /join ABC123`,
+            {
+                inline_keyboard: [
+                    [{ text: t(lang, "btn_boy"),  callback_data: "menu2:boy:reset" }],
+                    [{ text: t(lang, "btn_girl"), callback_data: "menu2:girl:reset" }],
+                    [{ text: "➕ Create (boy)",  callback_data: "quick:create:boy" }],
+                    [{ text: "➕ Create (girl)", callback_data: "quick:create:girl" }],
+                ]
+            }, lang, ctxMsgId
+        );
+        return null;
+    }
+
+    if (res.reason === "conflict") {
+        // пара занята без вас — предлагаем «мягко» перепривязаться (по подтверждению)
+        await uiText(env, chatId, userId,
+            `⚠️ Похоже, у кода пары <b>${res.pairCode}</b> уже 2 участника, и вас среди них нет.
+
+Если это ошибка — попросите партнёра прислать инвайт-кнопку «Пригласить вторую половинку» или заново создайте пару.`,
+            {
+                inline_keyboard: [
+                    [{ text: t(lang, "btn_invite_partner"), callback_data: "invite:partner" }],
+                    [{ text: "🔁 Создать новую пару (я парень)", callback_data: "quick:create:boy" }],
+                    [{ text: "🔁 Создать новую пару (я девушка)", callback_data: "quick:create:girl" }],
+                ]
+            }, lang, ctxMsgId
+        );
+        return null;
+    }
+    return null;
+}
+
 // ── UI "single screen": edit or send & remember message_id
 async function uiText(env, chatId, userId, text, reply_markup, lang, ctxMessageId=null) {
     // 1) если есть message_id из callback — пробуем редактировать его
@@ -731,8 +837,10 @@ async function handleJoin(env, chatId, fromId, code, ctxMsgId=null) {
 }
 
 async function handleHome(env, chatId, fromId, ctxMsgId=null) {
-    const uDoc = await getUser(env, fromId);
+    const ok = await assertPairOrExplain(env, chatId, fromId, ctxMsgId);
+    const uDoc = ok ? ok.userDoc : await ensureUserDoc(env, fromId);
     const lang = fget(uDoc, "lang", "ru");
+    if (!ok) return; // экран уже показан объяснялкой
 
     await uiText(env, chatId, fromId, t(lang, "home_choose"), {
         inline_keyboard: [
@@ -747,8 +855,9 @@ async function handleHome(env, chatId, fromId, ctxMsgId=null) {
 }
 
 async function handleShowMenu(env, chatId, fromId, role, cursorStr=null, ctxMsgId=null) {
-    const uDoc = await getUser(env, fromId);
-    if (!uDoc) return uiText(env, chatId, fromId, I18N.ru.first_start_tip, undefined, "ru", ctxMsgId);
+    const ok = await assertPairOrExplain(env, chatId, fromId, ctxMsgId);
+    if (!ok) return;
+    const uDoc = ok.userDoc;
     const lang = fget(uDoc, "lang", "ru");
     const pairCode = fget(uDoc, "pairCode", "");
 
@@ -788,7 +897,9 @@ function flowSet(uid,v){ flows.set(uid,v); }
 function flowClear(uid){ flows.delete(uid); }
 
 async function handleAddItemStart(env, chatId, fromId, ctxMsgId=null) {
-    const uDoc = await getUser(env, fromId);
+    const ok = await assertPairOrExplain(env, chatId, fromId, ctxMsgId);
+    if (!ok) return;
+    const uDoc = ok.userDoc;
     const lang = fget(uDoc, "lang", "ru");
     const role = fget(uDoc, "role", "");
     if (!role) {
@@ -830,7 +941,9 @@ async function handleFlowPhoto(env, chatId, fromId, fileId) {
     const s = flowGet(fromId);
     if (!s || s.stage !== 5) return false;
 
-    const uDoc = await getUser(env, fromId);
+    const ok = await assertPairOrExplain(env, chatId, fromId);
+    if (!ok) return true;
+    const uDoc = ok.userDoc;
     if (!uDoc) { await uiText(env, chatId, fromId, I18N.ru.first_start_tip, undefined, "ru"); return true; }
     const lang = fget(uDoc, "lang", "ru");
     const role = fget(uDoc, "role", "");
@@ -861,7 +974,9 @@ async function handleFlowPhoto(env, chatId, fromId, fileId) {
 // Заказы: создание, просмотр, статусы, комментарии
 // ───────────────────────────────
 async function handleOrder(env, chatId, fromId, itemId, ctxMsgId=null) {
-    const uDoc = await getUser(env, fromId);
+    const ok = await assertPairOrExplain(env, chatId, fromId, ctxMsgId);
+    if (!ok) return;
+    const uDoc = ok.userDoc;
     const lang = fget(uDoc, "lang", "ru");
     if (!uDoc) return uiText(env, chatId, fromId, t(lang, "first_start_tip"), undefined, lang, ctxMsgId);
 
@@ -1038,8 +1153,9 @@ async function queryOrdersPage(env, pairCode, filter, myRole, myId, cursor) {
 }
 
 async function handleOrders(env, chatId, fromId, filter="all", cursorStr=null, ctxMsgId=null) {
-    const uDoc = await getUser(env, fromId);
-    if (!uDoc) return uiText(env, chatId, fromId, I18N.ru.first_start_tip, undefined, "ru", ctxMsgId);
+    const ok = await assertPairOrExplain(env, chatId, fromId, ctxMsgId);
+    if (!ok) return;
+    const uDoc = ok.userDoc;
     const lang = fget(uDoc, "lang", "ru");
     const pairCode = fget(uDoc, "pairCode", "");
     const myRole = fget(uDoc, "role", "");
@@ -1101,7 +1217,9 @@ function toCSV(rows) {
 }
 
 async function exportMenuCSV(env, chatId, userId) {
-    const uDoc = await getUser(env, userId);
+    const ok = await ensurePairIntegrity(env, userId);
+    if (!ok.ok) return; // тихо выходим, экран экспорта не нужен
+    const uDoc = ok.userDoc;
     const pairCode = fget(uDoc,"pairCode","");
     const docs = await fsRunQuery(env, {
         from: [{ collectionId: "menuItems" }],
@@ -1126,7 +1244,9 @@ async function exportMenuCSV(env, chatId, userId) {
 }
 
 async function exportOrdersCSV(env, chatId, userId) {
-    const uDoc = await getUser(env, userId);
+    const ok = await ensurePairIntegrity(env, userId);
+    if (!ok.ok) return; // тихо выходим, экран экспорта не нужен
+    const uDoc = ok.userDoc;
     const pairCode = fget(uDoc,"pairCode","");
     const docs = await fsRunQuery(env, {
         from: [{ collectionId: "orders" }],
@@ -1157,7 +1277,8 @@ async function exportOrdersCSV(env, chatId, userId) {
 // Pair delete handlers
 // ───────────────────────────────
 async function handlePairDeleteStart(env, chatId, fromId, ctxMsgId=null) {
-    const u = await getUser(env, fromId);
+    const ok = await ensurePairIntegrity(env, fromId);
+    const u = ok.userDoc;
     const lang = fget(u,"lang","ru");
     const pairCode = fget(u,"pairCode","");
     if (!pairCode) return uiText(env, chatId, fromId, t(lang,"delpair_need_pair"), undefined, lang, ctxMsgId);
@@ -1186,7 +1307,8 @@ async function handlePairDeleteStart(env, chatId, fromId, ctxMsgId=null) {
     await uiText(env, chatId, fromId, t(lang,"delpair_request_created"), undefined, lang, ctxMsgId);
 }
 async function handlePairDeleteCancel(env, chatId, fromId, ctxMsgId=null) {
-    const u = await getUser(env, fromId);
+    const ok = await ensurePairIntegrity(env, fromId);
+    const u = ok.userDoc;
     const lang = fget(u,"lang","ru");
     const pairCode = fget(u,"pairCode","");
     if (!pairCode) return uiText(env, chatId, fromId, t(lang,"delpair_need_pair"), undefined, lang, ctxMsgId);
@@ -1208,7 +1330,8 @@ async function handlePairDeleteCancel(env, chatId, fromId, ctxMsgId=null) {
     }
 }
 async function handlePairDeleteConfirm(env, chatId, fromId, ctxMsgId=null) {
-    const u = await getUser(env, fromId);
+    const ok = await ensurePairIntegrity(env, fromId);
+    const u = ok.userDoc;
     const lang = fget(u,"lang","ru");
     const pairCode = fget(u,"pairCode","");
     if (!pairCode) return uiText(env, chatId, fromId, t(lang,"delpair_need_pair"), undefined, lang, ctxMsgId);
@@ -1370,7 +1493,11 @@ export default {
                     await handlePairDeleteConfirm(env, chatId, fromId, ctxMsgId);
                 } else if (data === "pairdel:cancel") {
                     await handlePairDeleteCancel(env, chatId, fromId, ctxMsgId);
-                }
+                } else if (data === "quick:create:boy") {
+                await handleCreate(env, chatId, fromId, "boy", q.message.message_id);
+            } else if (data === "quick:create:girl") {
+                await handleCreate(env, chatId, fromId, "girl", q.message.message_id);
+            }
             }
 
             return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
