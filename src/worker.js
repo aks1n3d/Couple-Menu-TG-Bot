@@ -2,6 +2,7 @@
 //  Telegram + Firestore Worker
 //  Cloudflare Workers + Firestore REST (JWT)
 //  Фото блюд через Telegram file_id
+//  UI: обновляем один "экран" через editMessage*
 // ===============================
 
 const TG_API = (t) => `https://api.telegram.org/bot${t}`;
@@ -91,6 +92,8 @@ const I18N = {
         status_changed_notify: (id, status) => `Ваш заказ #${id} теперь в статусе: <b>${status}</b>`,
         status_saved: "Статус заказа обновлён.",
         reason_required: "Нужна причина. Напишите текст причины:",
+
+        // Удаление пары
         btn_delete_pair: "🗑 Удалить пару",
         delpair_need_pair: "Сначала создайте или присоединитесь к паре.",
         delpair_already_pending: "Запрос на удаление пары уже отправлен. Ожидаем согласие второго участника.",
@@ -116,6 +119,7 @@ const I18N = {
 • /export_menu — експорт меню (CSV)
 • /export_orders — експорт замовлень (CSV)`,
         home_choose: "Оберіть меню:",
+        btn_back: "⬅️ Назад",
         btn_boy: "🍽 Меню хлопця",
         btn_girl: "🍽 Меню дівчини",
         btn_add: "➕ Додати позицію",
@@ -177,7 +181,8 @@ const I18N = {
         status_changed_notify: (id, status) => `Ваше замовлення #${id} тепер у статусі: <b>${status}</b>`,
         status_saved: "Статус замовлення оновлено.",
         reason_required: "Потрібна причина. Напишіть текст причини:",
-        btn_back: "⬅️ Назад",
+
+        // delete pair
         btn_delete_pair: "🗑 Видалити пару",
         delpair_need_pair: "Спочатку створіть або приєднайтесь до пари.",
         delpair_already_pending: "Запит на видалення пари вже створено. Чекаємо згоду другого учасника.",
@@ -203,6 +208,7 @@ Create a pair and share the code, or join by code.
 • /export_menu — export menu (CSV)
 • /export_orders — export orders (CSV)`,
         home_choose: "Choose a menu:",
+        btn_back: "⬅️ Back",
         btn_boy: "🍽 Boy's menu",
         btn_girl: "🍽 Girl's menu",
         btn_add: "➕ Add item",
@@ -264,7 +270,8 @@ Created: ${dateStr}`,
         status_changed_notify: (id, status) => `Your order #${id} is now: <b>${status}</b>`,
         status_saved: "Order status updated.",
         reason_required: "A reason is required. Please type it:",
-        btn_back: "⬅️ Back",
+
+        // delete pair
         btn_delete_pair: "🗑 Delete pair",
         delpair_need_pair: "Create or join a pair first.",
         delpair_already_pending: "A delete request already exists. Waiting for your partner to confirm.",
@@ -336,23 +343,18 @@ async function gcpAccessToken(env) {
     if (!data.access_token) throw new Error("No access_token: " + JSON.stringify(data));
     return data.access_token;
 }
+
+// ── keyboards: always add "Back"
 function withBack(reply_markup, lang = "ru") {
-    // приведём к виду { inline_keyboard: [...] }
     let kb = reply_markup && reply_markup.inline_keyboard
         ? reply_markup
         : { inline_keyboard: [] };
-
-    // проверим, есть ли уже кнопка с callback_data=home или с таким же текстом
-    const hasBack = kb.inline_keyboard.some(
-        row => row.some(btn => btn.callback_data === "home")
-    );
-    if (!hasBack) {
-        kb.inline_keyboard.push([{ text: t(lang, "btn_back"), callback_data: "home" }]);
-    }
+    const hasHome = kb.inline_keyboard.some(row => row.some(btn => btn.callback_data === "home"));
+    if (!hasHome) kb.inline_keyboard.push([{ text: t(lang, "btn_back"), callback_data: "home" }]);
     return kb;
 }
 
-// Firestore REST
+// ── Firestore
 async function fsGet(env, path) {
     const token = await gcpAccessToken(env);
     const url = `https://firestore.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/databases/(default)/documents/${path}`;
@@ -381,7 +383,6 @@ async function fsCreate(env, collection, docId, fields) {
     return r.json();
 }
 async function fsPatch(env, path, fields) {
-    // обновление части полей документа
     const token = await gcpAccessToken(env);
     const url = `https://firestore.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/databases/(default)/documents/${path}?currentDocument.exists=true`;
     const r = await fetch(url, {
@@ -396,11 +397,8 @@ async function fsSet(env, path, fields) {
     const url = `https://firestore.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/databases/(default)/documents/${path}`;
     const r = await fetch(url, {
         method: "PATCH",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ fields: mapFields(fields) }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ fields: mapFields(fields) })
     });
     return r.json();
 }
@@ -408,7 +406,6 @@ async function fsDelete(env, path) {
     const token = await gcpAccessToken(env);
     const url = `https://firestore.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/databases/(default)/documents/${path}`;
     const r = await fetch(url, { method: "DELETE", headers: { Authorization: `Bearer ${token}` }});
-    // Firestore возвращает пустой ответ при успехе
     return r.ok;
 }
 function mapFields(obj) {
@@ -437,58 +434,141 @@ function genPairCode(len = 6) {
     return Array.from({ length: len }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
 }
 
-// Telegram helpers
-async function tgSendMessage(env, chat_id, text, reply_markup, lang = "ru") {
-    await fetch(`${TG_API(env.TG_TOKEN)}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            chat_id,
-            text,
-            parse_mode: "HTML",
-            reply_markup: withBack(reply_markup, lang)
-        }),
-    });
-}
-async function tgSendPhoto(env, chat_id, photo, caption, reply_markup, lang = "ru") {
-    await fetch(`${TG_API(env.TG_TOKEN)}/sendPhoto`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            chat_id,
-            photo,
-            caption,
-            parse_mode: "HTML",
-            reply_markup: withBack(reply_markup, lang)
-        }),
-    });
-}
-async function tgAnswerCallbackQuery(env, callback_query_id, text = "", show_alert = false) {
+// ── Telegram raw
+async function tgAnswerCallbackQuery(env, id, text = "", show_alert = false) {
     await fetch(`${TG_API(env.TG_TOKEN)}/answerCallbackQuery`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ callback_query_id, text, show_alert })
+        body: JSON.stringify({ callback_query_id: id, text, show_alert })
     });
+}
+async function tgSendMessageRaw(env, chat_id, text, reply_markup, lang="ru") {
+    const r = await fetch(`${TG_API(env.TG_TOKEN)}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id, text, parse_mode: "HTML", reply_markup: withBack(reply_markup, lang) }),
+    });
+    return r.json(); // {ok, result:{message_id,...}}
+}
+async function tgSendPhotoRaw(env, chat_id, photo, caption, reply_markup, lang="ru") {
+    const r = await fetch(`${TG_API(env.TG_TOKEN)}/sendPhoto`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id, photo, caption, parse_mode: "HTML", reply_markup: withBack(reply_markup, lang) }),
+    });
+    return r.json();
+}
+async function tgEditMessageTextRaw(env, chat_id, message_id, text, reply_markup, lang="ru") {
+    const r = await fetch(`${TG_API(env.TG_TOKEN)}/editMessageText`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ chat_id, message_id, text, parse_mode:"HTML", reply_markup: withBack(reply_markup, lang) })
+    });
+    return r.json();
+}
+async function tgEditMessageCaptionRaw(env, chat_id, message_id, caption, reply_markup, lang="ru") {
+    const r = await fetch(`${TG_API(env.TG_TOKEN)}/editMessageCaption`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ chat_id, message_id, caption, parse_mode:"HTML", reply_markup: withBack(reply_markup, lang) })
+    });
+    return r.json();
+}
+async function tgEditMessageMediaPhotoRaw(env, chat_id, message_id, photo, caption, reply_markup, lang="ru") {
+    const r = await fetch(`${TG_API(env.TG_TOKEN)}/editMessageMedia`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+            chat_id, message_id,
+            media: { type:"photo", media: photo, caption, parse_mode:"HTML" },
+            reply_markup: withBack(reply_markup, lang)
+        })
+    });
+    return r.json();
+}
+async function tgDeleteMessageRaw(env, chat_id, message_id) {
+    const r = await fetch(`${TG_API(env.TG_TOKEN)}/deleteMessage`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ chat_id, message_id })
+    });
+    return r.json();
 }
 async function tgSendDocument(env, chat_id, fileName, buf, mime="text/csv") {
     const fd = new FormData();
     fd.append("chat_id", String(chat_id));
     fd.append("document", new File([buf], fileName, { type: mime }));
-    await fetch(`${TG_API(env.TG_TOKEN)}/sendDocument`, { method:"POST", body: fd });
+    const r = await fetch(`${TG_API(env.TG_TOKEN)}/sendDocument`, { method:"POST", body: fd });
+    return r.json();
 }
 
-// Users helpers & deep-link
+// ── Users helpers & deep-link
 async function getUser(env, telegramId) { return await fsGet(env, `users/${telegramId}`); }
 async function setUser(env, telegramId, fields) { return await fsSet(env, `users/${telegramId}`, fields); }
 function botDeepLink(env, payload) { return `https://t.me/${env.BOT_USERNAME}?start=${encodeURIComponent(payload)}`; }
 
-//Pair delete
-// получить документ пары по коду
-async function getPairDoc(env, code) { return await fsGet(env, `pairs/${code}`); }
+// ── UI "single screen": edit or send & remember message_id
+async function uiText(env, chatId, userId, text, reply_markup, lang, ctxMessageId=null) {
+    // 1) если есть message_id из callback — пробуем редактировать его
+    if (ctxMessageId) {
+        const e = await tgEditMessageTextRaw(env, chatId, ctxMessageId, text, reply_markup, lang);
+        if (e?.ok) return { edited: true, message_id: ctxMessageId, type:"text" };
+    }
+    // 2) редактировать предыдущий экран пользователя
+    const uDoc = await getUser(env, userId);
+    const lastId = Number(fget(uDoc,"lastMsgId",0));
+    const lastType = fget(uDoc,"lastMsgType","text");
+    if (lastId && lastType === "text") {
+        const e2 = await tgEditMessageTextRaw(env, chatId, lastId, text, reply_markup, lang);
+        if (e2?.ok) return { edited:true, message_id:lastId, type:"text" };
+    }
+    if (lastId && lastType === "photo") {
+        // пробуем сменить только подпись
+        const e3 = await tgEditMessageCaptionRaw(env, chatId, lastId, text, reply_markup, lang);
+        if (e3?.ok) { await setUser(env, userId, { lastMsgType:"photo" }); return {edited:true, message_id:lastId, type:"photo"}; }
+    }
+    // 3) отправляем новое и запоминаем
+    const s = await tgSendMessageRaw(env, chatId, text, reply_markup, lang);
+    if (s?.ok) {
+        await setUser(env, userId, { lastMsgId: s.result.message_id, lastMsgType: "text" });
+        // удалить старое (опционально): если был предыдущий lastId — удалим
+        if (lastId && lastId !== s.result.message_id) { try { await tgDeleteMessageRaw(env, chatId, lastId); } catch(e){} }
+        return { edited:false, message_id:s.result.message_id, type:"text" };
+    }
+    return { edited:false };
+}
+async function uiPhoto(env, chatId, userId, photoFileId, caption, reply_markup, lang, ctxMessageId=null) {
+    // 1) если есть message_id из callback — пробуем заменить media
+    if (ctxMessageId) {
+        const e = await tgEditMessageMediaPhotoRaw(env, chatId, ctxMessageId, photoFileId, caption, reply_markup, lang);
+        if (e?.ok) return { edited:true, message_id:ctxMessageId, type:"photo" };
+    }
+    // 2) редактировать предыдущий экран
+    const uDoc = await getUser(env, userId);
+    const lastId = Number(fget(uDoc,"lastMsgId",0));
+    const lastType = fget(uDoc,"lastMsgType","text");
+    if (lastId && lastType === "photo") {
+        const e2 = await tgEditMessageMediaPhotoRaw(env, chatId, lastId, photoFileId, caption, reply_markup, lang);
+        if (e2?.ok) return { edited:true, message_id:lastId, type:"photo" };
+    }
+    if (lastId && lastType === "text") {
+        // текст → фото: старый экран удалим, пришлём фото
+        try { await tgDeleteMessageRaw(env, chatId, lastId); } catch(e){}
+    }
+    // 3) отправляем новое фото
+    const s = await tgSendPhotoRaw(env, chatId, photoFileId, caption, reply_markup, lang);
+    if (s?.ok) {
+        await setUser(env, userId, { lastMsgId: s.result.message_id, lastMsgType: "photo" });
+        return { edited:false, message_id:s.result.message_id, type:"photo" };
+    }
+    return { edited:false };
+}
 
-// удалить все menuItems и orders пары
+// ───────────────────────────────
+// Pair delete helpers
+// ───────────────────────────────
+async function getPairDoc(env, code) { return await fsGet(env, `pairs/${code}`); }
 async function wipePairCollections(env, pairCode) {
-    // menuItems
     const items = await fsRunQuery(env, {
         from:[{collectionId:"menuItems"}],
         where:{ fieldFilter:{ field:{fieldPath:"pairCode"}, op:"EQUAL", value:{ stringValue: pairCode } } },
@@ -498,7 +578,6 @@ async function wipePairCollections(env, pairCode) {
         const id = d.name.split("/").pop();
         await fsDelete(env, `menuItems/${id}`);
     }
-    // orders
     const orders = await fsRunQuery(env, {
         from:[{collectionId:"orders"}],
         where:{ fieldFilter:{ field:{fieldPath:"pairCode"}, op:"EQUAL", value:{ stringValue: pairCode } } },
@@ -509,57 +588,82 @@ async function wipePairCollections(env, pairCode) {
         await fsDelete(env, `orders/${id}`);
     }
 }
-
-// найти второго участника пары
 async function findOtherMemberId(env, pairDoc, meId) {
     let members=[];
     try { members = JSON.parse(fget(pairDoc,"members","[]")); } catch { members=[]; }
     return members.find(x => Number(x) !== Number(meId)) || null;
 }
-
-// полная финализация удаления пары (после второго согласия)
 async function finalizePairDelete(env, initiatorId, confirmerId, pairCode) {
-    // отвязать обоих пользователей от пары
     const pDoc = await getPairDoc(env, pairCode);
     let members=[];
     try { members = JSON.parse(fget(pDoc,"members","[]")); } catch { members=[]; }
     for (const uid of members) {
-        await setUser(env, uid, { pairCode: "" }); // роль оставим
+        await setUser(env, uid, { pairCode: "" });
     }
-    // очистить коллекции и саму пару
     await wipePairCollections(env, pairCode);
     await fsDelete(env, `pairs/${pairCode}`);
-    // уведомить обоих
     const u1 = await getUser(env, initiatorId); const lang1 = fget(u1,"lang","ru");
     const u2 = await getUser(env, confirmerId); const lang2 = fget(u2,"lang","ru");
-    await tgSendMessage(env, initiatorId, t(lang1,"delpair_done_both"));
-    await tgSendMessage(env, confirmerId, t(lang2,"delpair_done_both"));
+    await tgSendMessageRaw(env, initiatorId, t(lang1,"delpair_done_both"));
+    await tgSendMessageRaw(env, confirmerId, t(lang2,"delpair_done_both"));
 }
 
 // ───────────────────────────────
-// UI helpers
+// UI helpers (screens)
 // ───────────────────────────────
-async function sendLangChoice(env, chatId) {
+async function sendLangChoice(env, chatId, userId) {
     const kb = { inline_keyboard: [
             [{ text: "🇷🇺 Русский", callback_data: "lang:ru" }],
             [{ text: "🇺🇦 Українська", callback_data: "lang:uk" }],
             [{ text: "🇬🇧 English", callback_data: "lang:en" }],
         ]};
-    await tgSendMessage(env, chatId, I18N.ru.start_choose, kb);
+    await uiText(env, chatId, userId, I18N.ru.start_choose, kb, "ru");
 }
-async function sendRoleChoice(env, chatId, lang) {
-    await tgSendMessage(env, chatId, t(lang, "choose_role"), {
+async function sendRoleChoice(env, chatId, userId, lang, ctxMsgId=null) {
+    await uiText(env, chatId, userId, t(lang, "choose_role"), {
         inline_keyboard: [
             [{ text: t(lang, "role_boy"), callback_data: "setrole:boy" }],
             [{ text: t(lang, "role_girl"), callback_data: "setrole:girl" }],
         ]
-    });
+    }, lang, ctxMsgId);
+}
+
+// ───────────────────────────────
+// Menu pagination (cursor, no offset)
+// ───────────────────────────────
+function mEncodeCursor(createdAt, id){ return `${createdAt}|${id}`; }
+function mDecodeCursor(s){ if(!s) return null; const [a,b]=s.split("|"); return { createdAt:Number(a), id:b }; }
+
+async function queryMenuPage(env, pairCode, role, cursor) {
+    const q = {
+        from: [{ collectionId: "menuItems" }],
+        where: { compositeFilter: { op:"AND", filters: [
+                    { fieldFilter:{ field:{fieldPath:"pairCode"}, op:"EQUAL", value:{ stringValue: pairCode } } },
+                    { fieldFilter:{ field:{fieldPath:"ownerRole"}, op:"EQUAL", value:{ stringValue: role } } },
+                ]}},
+        orderBy: [
+            { field:{ fieldPath:"createdAt" }, direction:"DESCENDING" },
+            { field:{ fieldPath:"id"        }, direction:"DESCENDING" },
+        ],
+        limit: 1
+    };
+    if (cursor) {
+        q.startAt = {
+            values: [
+                { integerValue: String(cursor.createdAt) },
+                { stringValue: cursor.id }
+            ],
+            before: false
+        };
+        q.offset = 1;
+    }
+    return await fsRunQuery(env, q);
 }
 
 // ───────────────────────────────
 // Handlers: start / create / join / home / menus
 // ───────────────────────────────
-async function handleStart(env, chatId, fromId, payloadRaw = "") {
+async function handleStart(env, chatId, fromId, payloadRaw = "", ctxMsgId=null) {
     const joinMatch = /^join-([A-Z0-9]{4,12})$/.exec(payloadRaw || "");
     const langMatch = /^lang-(ru|uk|en)$/.exec(payloadRaw || "");
     const refMatch  = /^ref-(\d+)$/.exec(payloadRaw || "");
@@ -571,16 +675,16 @@ async function handleStart(env, chatId, fromId, payloadRaw = "") {
         await setUser(env, fromId, { telegramId: fromId, lang: langMatch[1] });
     }
     if (joinMatch) {
-        return await handleJoin(env, chatId, fromId, joinMatch[1]);
+        return await handleJoin(env, chatId, fromId, joinMatch[1], ctxMsgId);
     }
 
     const userDoc = await getUser(env, fromId);
     const lang = fget(userDoc, "lang", null);
-    if (!lang) return sendLangChoice(env, chatId);
-    await tgSendMessage(env, chatId, t(lang, "start_help"));
+    if (!lang) return sendLangChoice(env, chatId, fromId);
+    await uiText(env, chatId, fromId, t(lang, "start_help"), undefined, lang, ctxMsgId);
 }
 
-async function handleCreate(env, chatId, fromId, role) {
+async function handleCreate(env, chatId, fromId, role, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc, "lang", "ru");
 
@@ -593,215 +697,131 @@ async function handleCreate(env, chatId, fromId, role) {
         await fsCreate(env, "referrals", `R-${Date.now()}-${fromId}`, { refBy, newUserId: fromId, pairCode: code, createdAt: Date.now() });
     }
 
-    await tgSendMessage(env, chatId, t(lang, "pair_created", code), {
+    await uiText(env, chatId, fromId, t(lang, "pair_created", code), {
         inline_keyboard: [
-            [{ text: t(lang, "btn_boy"), callback_data: "menu:boy:0" }],
-            [{ text: t(lang, "btn_girl"), callback_data: "menu:girl:0" }],
+            [{ text: t(lang, "btn_boy"), callback_data: "menu2:boy:reset" }],
+            [{ text: t(lang, "btn_girl"), callback_data: "menu2:girl:reset" }],
             [{ text: t(lang, "btn_add"), callback_data: "item:add" }],
             [{ text: t(lang, "invite_partner_btn"), callback_data: "invite:partner" }],
         ],
-    });
+    }, lang, ctxMsgId);
 }
 
-async function handleJoin(env, chatId, fromId, code) {
+async function handleJoin(env, chatId, fromId, code, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc, "lang", "ru");
 
     const pair = await fsGet(env, `pairs/${code}`);
-    if (!pair) return tgSendMessage(env, chatId, `Код <b>${code}</b> не найден 😔`);
+    if (!pair) return uiText(env, chatId, fromId, `Код <b>${code}</b> не найден 😔`, undefined, lang, ctxMsgId);
 
     let members = [];
     try { members = JSON.parse(fget(pair, "members", "[]")); } catch { members = []; }
     if (!members.includes(fromId)) {
-        if (members.length >= 2) return tgSendMessage(env, chatId, `Эта пара уже заполнена двумя участниками.`);
+        if (members.length >= 2) return uiText(env, chatId, fromId, `Эта пара уже заполнена двумя участниками.`, undefined, lang, ctxMsgId);
         members.push(fromId);
         await fsSet(env, `pairs/${code}`, { members: JSON.stringify(members) });
     }
     await setUser(env, fromId, { telegramId: fromId, pairCode: code });
-    await tgSendMessage(env, chatId, t(lang, "pair_join_ok", code), { inline_keyboard: [[{ text: "Домой", callback_data: "home" }]] });
+    await uiText(env, chatId, fromId, t(lang, "pair_join_ok", code), {
+        inline_keyboard: [[{ text: "🏠", callback_data: "home" }]]
+    }, lang, ctxMsgId);
 
     const curRole = fget(uDoc, "role", "");
-    if (!curRole) await sendRoleChoice(env, chatId, lang);
+    if (!curRole) await sendRoleChoice(env, chatId, fromId, lang, ctxMsgId);
 }
 
-async function handleHome(env, chatId, fromId) {
+async function handleHome(env, chatId, fromId, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc, "lang", "ru");
 
-    await tgSendMessage(env, chatId, t(lang, "home_choose"), {
+    await uiText(env, chatId, fromId, t(lang, "home_choose"), {
         inline_keyboard: [
-            [{ text: t(lang, "btn_boy"), callback_data: "menu:boy:0" }],
-            [{ text: t(lang, "btn_girl"), callback_data: "menu:girl:0" }],
+            [{ text: t(lang, "btn_boy"),  callback_data: "menu2:boy:reset" }],
+            [{ text: t(lang, "btn_girl"), callback_data: "menu2:girl:reset" }],
             [{ text: t(lang, "btn_add"), callback_data: "item:add" }],
             [{ text: t(lang, "btn_history"), callback_data: "orders:all:reset" }],
             [{ text: t(lang, "btn_invite_others"), callback_data: "invite:others" }],
             [{ text: t(lang, "btn_delete_pair"), callback_data: "pairdel:start" }],
         ]
-    });
+    }, lang, ctxMsgId);
 }
 
-async function handleShowMenu(env, chatId, fromId, role, page = 0) {
+async function handleShowMenu(env, chatId, fromId, role, cursorStr=null, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
-    if (!uDoc) return tgSendMessage(env, chatId, I18N.ru.first_start_tip);
+    if (!uDoc) return uiText(env, chatId, fromId, I18N.ru.first_start_tip, undefined, "ru", ctxMsgId);
     const lang = fget(uDoc, "lang", "ru");
     const pairCode = fget(uDoc, "pairCode", "");
 
-    const docs = await fsRunQuery(env, {
-        from: [{ collectionId: "menuItems" }],
-        where: { compositeFilter: {
-                op: "AND",
-                filters: [
-                    { fieldFilter: { field: { fieldPath: "pairCode" }, op: "EQUAL", value: { stringValue: pairCode } } },
-                    { fieldFilter: { field: { fieldPath: "ownerRole" }, op: "EQUAL", value: { stringValue: role } } },
-                ]
-            }},
-        orderBy: [{ field: { fieldPath: "createdAt" }, direction: "DESCENDING" }],
-        limit: 1, offset: page
-    });
+    const cursor = mDecodeCursor(cursorStr);
+    const docs = await queryMenuPage(env, pairCode, role, cursor);
+    if (!docs.length) return uiText(env, chatId, fromId, t(lang, "no_positions"), undefined, lang, ctxMsgId);
 
-    if (!docs.length) return tgSendMessage(env, chatId, t(lang, "no_positions"));
-
-    const it = docs[0], id = it.name.split("/").pop();
-    const title = fget(it, "title", ""), description = fget(it, "description", ""), priceLove = fget(it, "priceLove", "");
+    const it = docs[0];
+    const id = it.name.split("/").pop();
+    const title = fget(it, "title", "");
+    const description = fget(it, "description", "");
+    const priceLove = fget(it, "priceLove", "");
     const photoFileId = fget(it, "photoFileId", null);
+    const createdAt = fget(it, "createdAt", 0);
+    const nextCur = mEncodeCursor(createdAt, id);
 
     const caption = `#${id}\n<b>${title}</b>\n${description}\nЦена: <b>${priceLove}</b>`;
-    const nav = {
+    const kb = {
         inline_keyboard: [
             [{ text: "🛒 Заказать", callback_data: `order:${id}` }],
             [
-                { text: "◀️", callback_data: `menu:${role}:${Math.max(0, page - 1)}` },
-                { text: "▶️", callback_data: `menu:${role}:${page + 1}` }
+                { text: "▶️", callback_data: `menu2:${role}:next:${nextCur}` },
+                { text: "⏮️", callback_data: `menu2:${role}:reset` }
             ]
         ]
     };
-    if (photoFileId) await tgSendPhoto(env, chatId, photoFileId, caption, nav);
-    else await tgSendMessage(env, chatId, caption, nav);
-}
-
-async function handlePairDeleteStart(env, chatId, fromId) {
-    const u = await getUser(env, fromId);
-    const lang = fget(u,"lang","ru");
-    const pairCode = fget(u,"pairCode","");
-    if (!pairCode) return tgSendMessage(env, chatId, t(lang,"delpair_need_pair"));
-
-    const pair = await getPairDoc(env, pairCode);
-    // если уже есть запрос — просто сообщим
-    const pendingBy = fget(pair,"deleteRequestedBy",0);
-    if (pendingBy) {
-        return tgSendMessage(env, chatId, t(lang,"delpair_already_pending"));
-    }
-
-    // создаём запрос
-    await fsPatch(env, `pairs/${pairCode}`, {
-        deleteRequestedBy: Number(fromId),
-        deleteRequestedAt: Date.now()
-    });
-
-    // уведомим второго участника
-    const otherId = await findOtherMemberId(env, pair, fromId);
-    if (otherId) {
-        const ou = await getUser(env, otherId); const olang = fget(ou,"lang","ru");
-        await tgSendMessage(env, otherId, t(olang,"delpair_partner_prompt"), {
-            inline_keyboard: [
-                [{ text: t(olang,"btn_confirm_delete"), callback_data: "pairdel:confirm" }],
-                [{ text: t(olang,"btn_cancel_delete"),  callback_data: "pairdel:cancel"  }],
-            ]
-        });
-    }
-
-    await tgSendMessage(env, chatId, t(lang,"delpair_request_created"));
-}
-
-async function handlePairDeleteCancel(env, chatId, fromId) {
-    const u = await getUser(env, fromId);
-    const lang = fget(u,"lang","ru");
-    const pairCode = fget(u,"pairCode","");
-    if (!pairCode) return tgSendMessage(env, chatId, t(lang,"delpair_need_pair"));
-
-    const pair = await getPairDoc(env, pairCode);
-    const pendingBy = fget(pair,"deleteRequestedBy",0);
-    if (!pendingBy) return tgSendMessage(env, chatId, t(lang,"delpair_nothing_pending"));
-
-    // только участники пары могут отменять
-    let members=[]; try { members = JSON.parse(fget(pair,"members","[]")); } catch {}
-    if (!members.includes(fromId)) return tgSendMessage(env, chatId, t(lang,"delpair_not_member"));
-
-    await fsPatch(env, `pairs/${pairCode}`, { deleteRequestedBy: 0, deleteRequestedAt: 0 });
-    // уведомим обоих
-    const otherId = await findOtherMemberId(env, pair, fromId);
-    await tgSendMessage(env, chatId, t(lang,"delpair_cancelled"));
-    if (otherId) {
-        const ou = await getUser(env, otherId); const olang = fget(ou,"lang","ru");
-        await tgSendMessage(env, otherId, t(olang,"delpair_cancelled"));
-    }
-}
-
-async function handlePairDeleteConfirm(env, chatId, fromId) {
-    const u = await getUser(env, fromId);
-    const lang = fget(u,"lang","ru");
-    const pairCode = fget(u,"pairCode","");
-    if (!pairCode) return tgSendMessage(env, chatId, t(lang,"delpair_need_pair"));
-
-    const pair = await getPairDoc(env, pairCode);
-    const pendingBy = fget(pair,"deleteRequestedBy",0);
-    if (!pendingBy) return tgSendMessage(env, chatId, t(lang,"delpair_nothing_pending"));
-
-    // только второй участник может подтвердить (не тот, кто запросил)
-    if (Number(pendingBy) === Number(fromId)) {
-        // он же может отменить — через "pairdel:cancel"
-        return tgSendMessage(env, chatId, t(lang,"delpair_already_pending"));
-    }
-
-    const otherId = Number(pendingBy);
-    await finalizePairDelete(env, otherId, fromId, pairCode);
+    if (photoFileId) await uiPhoto(env, chatId, fromId, photoFileId, caption, kb, lang, ctxMsgId);
+    else await uiText(env, chatId, fromId, caption, kb, lang, ctxMsgId);
 }
 
 // ───────────────────────────────
-// Добавление позиции — только в своё меню
+// Добавление позиции — только в своё меню (dialog flow)
 // ───────────────────────────────
 const flows = new Map();
 function flowGet(uid){ return flows.get(uid); }
 function flowSet(uid,v){ flows.set(uid,v); }
 function flowClear(uid){ flows.delete(uid); }
 
-async function handleAddItemStart(env, chatId, fromId) {
+async function handleAddItemStart(env, chatId, fromId, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc, "lang", "ru");
     const role = fget(uDoc, "role", "");
     if (!role) {
-        await tgSendMessage(env, chatId, t(lang, "role_required"));
-        await sendRoleChoice(env, chatId, lang);
+        await uiText(env, chatId, fromId, t(lang, "role_required"), undefined, lang, ctxMsgId);
+        await sendRoleChoice(env, chatId, fromId, lang, ctxMsgId);
         return;
     }
     flowSet(fromId, { stage: 2, draft: { ownerRole: role } });
-    await tgSendMessage(env, chatId, t(lang, "add_flow_title"));
+    await uiText(env, chatId, fromId, t(lang, "add_flow_title"), undefined, lang, ctxMsgId);
 }
 async function handleFlowText(env, chatId, fromId, text) {
     const s = flowGet(fromId);
     if (!s) {
-        // может быть в режиме комментария к заказу
         const used = await handleCommentFlowText(env, chatId, fromId, text);
         return used;
     }
-
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc, "lang", "ru");
     const msg = (text || "").trim();
 
     if (s.stage === 2) {
         s.draft.title = msg; s.stage = 3;
-        await tgSendMessage(env, chatId, t(lang, "add_flow_desc"));
+        await uiText(env, chatId, fromId, t(lang, "add_flow_desc"), undefined, lang);
         return true;
     }
     if (s.stage === 3) {
         s.draft.description = msg; s.stage = 4;
-        await tgSendMessage(env, chatId, t(lang, "add_flow_price"));
+        await uiText(env, chatId, fromId, t(lang, "add_flow_price"), undefined, lang);
         return true;
     }
     if (s.stage === 4) {
         s.draft.priceLove = msg; s.stage = 5;
-        await tgSendMessage(env, chatId, t(lang, "add_flow_photo"));
+        await uiText(env, chatId, fromId, t(lang, "add_flow_photo"), undefined, lang);
         return true;
     }
     return true;
@@ -811,13 +831,13 @@ async function handleFlowPhoto(env, chatId, fromId, fileId) {
     if (!s || s.stage !== 5) return false;
 
     const uDoc = await getUser(env, fromId);
-    if (!uDoc) { await tgSendMessage(env, chatId, I18N.ru.first_start_tip); return true; }
+    if (!uDoc) { await uiText(env, chatId, fromId, I18N.ru.first_start_tip, undefined, "ru"); return true; }
     const lang = fget(uDoc, "lang", "ru");
     const role = fget(uDoc, "role", "");
-    if (!role) { await tgSendMessage(env, chatId, t(lang, "role_required")); return true; }
+    if (!role) { await uiText(env, chatId, fromId, t(lang, "role_required"), undefined, lang); return true; }
 
     if (s.draft.ownerRole !== role) {
-        await tgSendMessage(env, chatId, t(lang, "you_can_only_add_to_own"));
+        await uiText(env, chatId, fromId, t(lang, "you_can_only_add_to_own"), undefined, lang);
         s.draft.ownerRole = role;
     }
 
@@ -833,21 +853,21 @@ async function handleFlowPhoto(env, chatId, fromId, fileId) {
         photoFileId: fileId,
         createdAt: Date.now()
     });
-    await tgSendMessage(env, chatId, t(lang, "item_added", id));
+    await uiText(env, chatId, fromId, t(lang, "item_added", id), undefined, lang);
     flowClear(fromId); return true;
 }
 
 // ───────────────────────────────
 // Заказы: создание, просмотр, статусы, комментарии
 // ───────────────────────────────
-async function handleOrder(env, chatId, fromId, itemId) {
+async function handleOrder(env, chatId, fromId, itemId, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc, "lang", "ru");
-    if (!uDoc) return tgSendMessage(env, chatId, t(lang, "first_start_tip"));
+    if (!uDoc) return uiText(env, chatId, fromId, t(lang, "first_start_tip"), undefined, lang, ctxMsgId);
 
     const pairCode = fget(uDoc, "pairCode", "");
     const itemDoc = await fsGet(env, `menuItems/${itemId}`);
-    if (!itemDoc) return tgSendMessage(env, chatId, "Позиция не найдена");
+    if (!itemDoc) return uiText(env, chatId, fromId, "Позиция не найдена", undefined, lang, ctxMsgId);
     const toRole = fget(itemDoc, "ownerRole", "boy");
     const id = `ORD-${Date.now()}`;
 
@@ -862,7 +882,7 @@ async function handleOrder(env, chatId, fromId, itemId) {
         updatedBy: fromId
     });
 
-    // уведомим получателя
+    // уведомим получателя — отдельным сообщением
     const mates = await fsRunQuery(env, {
         from: [{ collectionId: "users" }],
         where: { compositeFilter: { op:"AND", filters: [
@@ -874,16 +894,16 @@ async function handleOrder(env, chatId, fromId, itemId) {
     if (mates.length) {
         const receiverId = Number(fget(mates[0], "telegramId", 0));
         if (receiverId) {
-            await tgSendMessage(env, receiverId, t(lang, "order_new_for_receiver", itemId), {
+            await tgSendMessageRaw(env, receiverId, t(lang, "order_new_for_receiver", itemId), {
                 inline_keyboard: [
                     [{ text: t(lang, "orders_view"), callback_data: `orderview:${id}` }],
                     [{ text: t(lang, "btn_accept"), callback_data: `orderstatus:${id}:accepted` }],
                     [{ text: t(lang, "btn_reject"), callback_data: `orderstatus:${id}:rejected` }]
                 ]
-            });
+            }, lang);
         }
     }
-    await tgSendMessage(env, chatId, t(lang, "order_ok_for_sender"));
+    await uiText(env, chatId, fromId, t(lang, "order_ok_for_sender"), undefined, lang, ctxMsgId);
 }
 
 function fmtDate(ts, lang) {
@@ -894,7 +914,7 @@ function fmtDate(ts, lang) {
     } catch { return String(ts); }
 }
 
-async function renderOrderCard(env, chatId, viewerId, orderId) {
+async function renderOrderCard(env, chatId, viewerId, orderId, ctxMsgId=null) {
     const oDoc = await fsGet(env, `orders/${orderId}`);
     if (!oDoc) return;
     const fromUserId = fget(oDoc,"fromUserId",0);
@@ -915,18 +935,16 @@ async function renderOrderCard(env, chatId, viewerId, orderId) {
     const text = `<b>${t(lang,"order_card_title", orderId)}</b>\n` +
         t(lang, "order_card_body", title, itemId, priceLove, fromUserId, toRole, status, comment, fmtDate(createdAt,lang));
 
-    // кнопки: если зритель — получатель (его роль == toRole), то дать действия
-    let kb = { inline_keyboard: [[{ text:"🏠", callback_data:"home" }]] };
+    let kb = { inline_keyboard: [] };
     if (myRole && myRole === toRole) {
-        const row1 = [{ text: t(lang,"btn_accept"), callback_data: `orderstatus:${orderId}:accepted` }];
-        const row2 = [{ text: t(lang,"btn_reject"), callback_data: `orderstatus:${orderId}:rejected` }];
-        const row3 = [{ text: t(lang,"btn_done"),   callback_data: `orderstatus:${orderId}:done` }];
-        kb = { inline_keyboard: [row1,row2,row3,[{ text:"🏠", callback_data:"home" }]] };
+        kb.inline_keyboard.push([{ text: t(lang,"btn_accept"), callback_data: `orderstatus:${orderId}:accepted` }]);
+        kb.inline_keyboard.push([{ text: t(lang,"btn_reject"), callback_data: `orderstatus:${orderId}:rejected` }]);
+        kb.inline_keyboard.push([{ text: t(lang,"btn_done"),   callback_data: `orderstatus:${orderId}:done` }]);
     }
-    await tgSendMessage(env, chatId, text, kb);
+    await uiText(env, chatId, viewerId, text, kb, lang, ctxMsgId);
 }
 
-// ── Комментарии к смене статуса (flow)
+// комментарии к смене статуса (flow)
 const commentFlows = new Map(); // key: userId -> { orderId, nextStatus, requireReason }
 function commentFlowSet(uid, v){ commentFlows.set(uid, v); }
 function commentFlowGet(uid){ return commentFlows.get(uid); }
@@ -940,7 +958,7 @@ async function handleCommentFlowText(env, chatId, fromId, text) {
     const msg = (text||"").trim();
 
     if (f.requireReason && (!msg || msg === "-")) {
-        await tgSendMessage(env, chatId, t(lang,"reason_required"));
+        await uiText(env, chatId, fromId, t(lang,"reason_required"), undefined, lang);
         return true;
     }
     const comment = (msg === "-" ? "" : msg);
@@ -948,24 +966,20 @@ async function handleCommentFlowText(env, chatId, fromId, text) {
     commentFlowClear(fromId);
     return true;
 }
-
-async function orderStatusPrompt(env, chatId, fromId, orderId, nextStatus) {
+async function orderStatusPrompt(env, chatId, fromId, orderId, nextStatus, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc,"lang","ru");
-
     if (nextStatus === "rejected") {
         commentFlowSet(fromId, { orderId, nextStatus, requireReason: true });
-        await tgSendMessage(env, chatId, t(lang,"enter_reason_reject"));
+        await uiText(env, chatId, fromId, t(lang,"enter_reason_reject"), undefined, lang, ctxMsgId);
     } else {
         commentFlowSet(fromId, { orderId, nextStatus, requireReason: false });
-        await tgSendMessage(env, chatId, t(lang,"enter_comment_optional"));
+        await uiText(env, chatId, fromId, t(lang,"enter_comment_optional"), undefined, lang, ctxMsgId);
     }
 }
-
 async function updateOrderStatus(env, chatId, actorId, orderId, status, comment) {
     const oDoc = await fsGet(env, `orders/${orderId}`);
     if (!oDoc) return;
-    const pairCode = fget(oDoc,"pairCode","");
     const fromUserId = fget(oDoc,"fromUserId",0);
 
     await fsPatch(env, `orders/${orderId}`, {
@@ -975,29 +989,20 @@ async function updateOrderStatus(env, chatId, actorId, orderId, status, comment)
         updatedBy: actorId
     });
 
-    // уведомить инициатора
     const actorDoc = await getUser(env, actorId);
     const lang = fget(actorDoc,"lang","ru");
     if (fromUserId) {
-        await tgSendMessage(env, fromUserId, t(lang,"status_changed_notify", orderId, status));
-        if (comment) {
-            await tgSendMessage(env, fromUserId, "💬 " + comment);
-        }
+        await tgSendMessageRaw(env, fromUserId, t(lang,"status_changed_notify", orderId, status));
+        if (comment) await tgSendMessageRaw(env, fromUserId, "💬 " + comment);
     }
-    await tgSendMessage(env, chatId, t(lang,"status_saved"));
+    await uiText(env, chatId, actorId, t(lang,"status_saved"), undefined, lang);
 }
 
 // ───────────────────────────────
 // История заказов — курсорная пагинация
 // ───────────────────────────────
-function encodeCursor(createdAt, id){
-    return `${createdAt}|${id}`;
-}
-function decodeCursor(s){
-    if (!s) return null;
-    const [a,b] = s.split("|");
-    return { createdAt: Number(a), id: b };
-}
+function encodeCursor(createdAt, id){ return `${createdAt}|${id}`; }
+function decodeCursor(s){ if (!s) return null; const [a,b] = s.split("|"); return { createdAt: Number(a), id: b }; }
 
 async function queryOrdersPage(env, pairCode, filter, myRole, myId, cursor) {
     const filters = [
@@ -1020,8 +1025,6 @@ async function queryOrdersPage(env, pairCode, filter, myRole, myId, cursor) {
     };
 
     if (cursor) {
-        // Firestore REST не имеет startAfter напрямую.
-        // Используем startAt по последней записи и пропускаем её через offset=1.
         structuredQuery.startAt = {
             values: [
                 { integerValue: String(cursor.createdAt) },
@@ -1031,13 +1034,12 @@ async function queryOrdersPage(env, pairCode, filter, myRole, myId, cursor) {
         };
         structuredQuery.offset = 1;
     }
-
     return await fsRunQuery(env, structuredQuery);
 }
 
-async function handleOrders(env, chatId, fromId, filter="all", cursorStr=null) {
+async function handleOrders(env, chatId, fromId, filter="all", cursorStr=null, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
-    if (!uDoc) return tgSendMessage(env, chatId, I18N.ru.first_start_tip);
+    if (!uDoc) return uiText(env, chatId, fromId, I18N.ru.first_start_tip, undefined, "ru", ctxMsgId);
     const lang = fget(uDoc, "lang", "ru");
     const pairCode = fget(uDoc, "pairCode", "");
     const myRole = fget(uDoc, "role", "");
@@ -1046,7 +1048,7 @@ async function handleOrders(env, chatId, fromId, filter="all", cursorStr=null) {
     const docs = await queryOrdersPage(env, pairCode, filter, myRole, fromId, cursor);
 
     if (!docs.length && !cursor) {
-        await tgSendMessage(env, chatId, t(lang,"orders_empty"), { inline_keyboard: [[{ text:"🏠", callback_data:"home"}]] });
+        await uiText(env, chatId, fromId, t(lang,"orders_empty"), { inline_keyboard: [[{ text:"🏠", callback_data:"home"}]] }, lang, ctxMsgId);
         return;
     }
 
@@ -1071,26 +1073,19 @@ async function handleOrders(env, chatId, fromId, filter="all", cursorStr=null) {
 
     const text = lines.join("\n\n");
     const kb = { inline_keyboard: [] };
-
-    // Управление страницами: Дальше / Сначала
     const navRow = [];
     if (docs.length === PAGE_SIZE) {
         navRow.push({ text: t(lang,"orders_next"), callback_data: `orders:${filter}:next:${lastCursor}` });
     }
     navRow.push({ text: t(lang,"orders_reset"), callback_data: `orders:${filter}:reset` });
     if (navRow.length) kb.inline_keyboard.push(navRow);
-
-    // Кнопки фильтров
     kb.inline_keyboard.push([
         { text:t(lang,"orders_filter_in"),  callback_data:"orders:in:reset"  },
         { text:t(lang,"orders_filter_out"), callback_data:"orders:out:reset" },
         { text:t(lang,"orders_filter_all"), callback_data:"orders:all:reset" }
     ]);
 
-    // Кнопка открыть последнюю заказ
-    kb.inline_keyboard.push([{ text:"🏠", callback_data:"home" }]);
-
-    await tgSendMessage(env, chatId, text, kb);
+    await uiText(env, chatId, fromId, text, kb, lang, ctxMsgId);
 }
 
 // ───────────────────────────────
@@ -1159,6 +1154,78 @@ async function exportOrdersCSV(env, chatId, userId) {
 }
 
 // ───────────────────────────────
+// Pair delete handlers
+// ───────────────────────────────
+async function handlePairDeleteStart(env, chatId, fromId, ctxMsgId=null) {
+    const u = await getUser(env, fromId);
+    const lang = fget(u,"lang","ru");
+    const pairCode = fget(u,"pairCode","");
+    if (!pairCode) return uiText(env, chatId, fromId, t(lang,"delpair_need_pair"), undefined, lang, ctxMsgId);
+
+    const pair = await getPairDoc(env, pairCode);
+    const pendingBy = fget(pair,"deleteRequestedBy",0);
+    if (pendingBy) {
+        return uiText(env, chatId, fromId, t(lang,"delpair_already_pending"), undefined, lang, ctxMsgId);
+    }
+
+    await fsPatch(env, `pairs/${pairCode}`, {
+        deleteRequestedBy: Number(fromId),
+        deleteRequestedAt: Date.now()
+    });
+
+    const otherId = await findOtherMemberId(env, pair, fromId);
+    if (otherId) {
+        const ou = await getUser(env, otherId); const olang = fget(ou,"lang","ru");
+        await tgSendMessageRaw(env, otherId, t(olang,"delpair_partner_prompt"), {
+            inline_keyboard: [
+                [{ text: t(olang,"btn_confirm_delete"), callback_data: "pairdel:confirm" }],
+                [{ text: t(olang,"btn_cancel_delete"),  callback_data: "pairdel:cancel"  }],
+            ]
+        }, olang);
+    }
+    await uiText(env, chatId, fromId, t(lang,"delpair_request_created"), undefined, lang, ctxMsgId);
+}
+async function handlePairDeleteCancel(env, chatId, fromId, ctxMsgId=null) {
+    const u = await getUser(env, fromId);
+    const lang = fget(u,"lang","ru");
+    const pairCode = fget(u,"pairCode","");
+    if (!pairCode) return uiText(env, chatId, fromId, t(lang,"delpair_need_pair"), undefined, lang, ctxMsgId);
+
+    const pair = await getPairDoc(env, pairCode);
+    const pendingBy = fget(pair,"deleteRequestedBy",0);
+    if (!pendingBy) return uiText(env, chatId, fromId, t(lang,"delpair_nothing_pending"), undefined, lang, ctxMsgId);
+
+    let members=[]; try { members = JSON.parse(fget(pair,"members","[]")); } catch {}
+    if (!members.includes(fromId)) return uiText(env, chatId, fromId, t(lang,"delpair_not_member"), undefined, lang, ctxMsgId);
+
+    await fsPatch(env, `pairs/${pairCode}`, { deleteRequestedBy: 0, deleteRequestedAt: 0 });
+
+    const otherId = await findOtherMemberId(env, pair, fromId);
+    await uiText(env, chatId, fromId, t(lang,"delpair_cancelled"), undefined, lang, ctxMsgId);
+    if (otherId) {
+        const ou = await getUser(env, otherId); const olang = fget(ou,"lang","ru");
+        await tgSendMessageRaw(env, otherId, t(olang,"delpair_cancelled"));
+    }
+}
+async function handlePairDeleteConfirm(env, chatId, fromId, ctxMsgId=null) {
+    const u = await getUser(env, fromId);
+    const lang = fget(u,"lang","ru");
+    const pairCode = fget(u,"pairCode","");
+    if (!pairCode) return uiText(env, chatId, fromId, t(lang,"delpair_need_pair"), undefined, lang, ctxMsgId);
+
+    const pair = await getPairDoc(env, pairCode);
+    const pendingBy = fget(pair,"deleteRequestedBy",0);
+    if (!pendingBy) return uiText(env, chatId, fromId, t(lang,"delpair_nothing_pending"), undefined, lang, ctxMsgId);
+
+    if (Number(pendingBy) === Number(fromId)) {
+        return uiText(env, chatId, fromId, t(lang,"delpair_already_pending"), undefined, lang, ctxMsgId);
+    }
+    const otherId = Number(pendingBy);
+    await finalizePairDelete(env, otherId, fromId, pairCode);
+    // экран обновлять не обязательно
+}
+
+// ───────────────────────────────
 // Router
 // ───────────────────────────────
 export default {
@@ -1175,11 +1242,11 @@ export default {
                 const chatId = m.chat.id, fromId = m.from.id;
                 const text = m.text || "";
 
-                // Фото для шага добавления
+                // Фото (этап флоу добавления)
                 if (m.photo && m.photo.length) {
                     const fileId = m.photo[m.photo.length - 1].file_id;
                     const handledAdd = await handleFlowPhoto(env, chatId, fromId, fileId);
-                    if (!handledAdd) await tgSendMessage(env, chatId, "Фото получено, но вы не в режиме добавления позиции.");
+                    if (!handledAdd) await tgSendMessageRaw(env, chatId, "Фото получено, но вы не в режиме добавления позиции.");
                     return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
                 }
 
@@ -1204,12 +1271,14 @@ export default {
                     await exportMenuCSV(env, chatId, fromId);
                 } else if (text.startsWith("/export_orders")) {
                     await exportOrdersCSV(env, chatId, fromId);
+                } else if (text === "/lang" || text === "/language") {
+                    await sendLangChoice(env, chatId, fromId);
                 } else {
                     const used = await handleFlowText(env, chatId, fromId, text);
                     if (!used) {
                         const uDoc = await getUser(env, fromId);
                         const lang = fget(uDoc, "lang", "ru");
-                        await tgSendMessage(env, chatId, t(lang, "unknown_cmd"));
+                        await uiText(env, chatId, fromId, t(lang, "unknown_cmd"), undefined, lang);
                     }
                 }
             }
@@ -1218,77 +1287,89 @@ export default {
                 const q = update.callback_query;
                 const chatId = q.message.chat.id, fromId = q.from.id;
                 const data = q.data || "";
+                const ctxMsgId = q.message.message_id;
 
                 try { await tgAnswerCallbackQuery(env, q.id); } catch (e) {}
 
+                // язык — обрабатываем сразу
                 if (data.startsWith("lang:")) {
                     const lang = data.split(":")[1];
-                    if (["ru","uk","en"].includes(lang)) {
+                    if (LANGS.includes(lang)) {
                         await setUser(env, fromId, { telegramId: fromId, lang });
-                        await tgSendMessage(env, chatId, t(lang, "start_help"), {
-                            inline_keyboard: [[{ text:"🏠", callback_data:"home" }]]
-                        });
+                        await handleStart(env, chatId, fromId, "", ctxMsgId);
                     } else {
-                        await tgSendMessage(env, chatId, I18N.ru.start_choose);
+                        await uiText(env, chatId, fromId, I18N.ru.start_choose, {
+                            inline_keyboard: [
+                                [{ text: "🇷🇺 Русский", callback_data: "lang:ru" }],
+                                [{ text: "🇺🇦 Українська", callback_data: "lang:uk" }],
+                                [{ text: "🇬🇧 English", callback_data: "lang:en" }],
+                            ]
+                        }, "ru", ctxMsgId);
                     }
                     return new Response(JSON.stringify({ ok:true }), { headers:{ "Content-Type":"application/json" }});
                 }
 
                 if (data === "home") {
-                    await handleHome(env, chatId, fromId);
-                } else if (data.startsWith("menu:")) {
-                    const [, role, pageStr] = data.split(":");
-                    await handleShowMenu(env, chatId, fromId, role, Number(pageStr || 0));
+                    await handleHome(env, chatId, fromId, ctxMsgId);
+                } else if (data.startsWith("menu2:")) {
+                    // menu2:<role>:(reset|next[:cursor])
+                    const parts = data.split(":");
+                    const role = parts[1];
+                    const mode = parts[2] || "reset";
+                    if (mode === "reset") {
+                        await handleShowMenu(env, chatId, fromId, role, null, ctxMsgId);
+                    } else if (mode === "next") {
+                        const cur = parts[3] || null;
+                        await handleShowMenu(env, chatId, fromId, role, cur, ctxMsgId);
+                    }
                 } else if (data === "item:add") {
-                    await handleAddItemStart(env, chatId, fromId);
+                    await handleAddItemStart(env, chatId, fromId, ctxMsgId);
                 } else if (data.startsWith("order:")) {
                     const itemId = data.split(":")[1];
-                    await handleOrder(env, chatId, fromId, itemId);
+                    await handleOrder(env, chatId, fromId, itemId, ctxMsgId);
                 } else if (data.startsWith("orders:")) {
-                    // format: orders:<filter>:(reset|next[:cursor])
                     const parts = data.split(":");
                     const filter = parts[1] || "all";
                     const mode = parts[2] || "reset";
                     if (mode === "reset") {
-                        await handleOrders(env, chatId, fromId, filter, null);
+                        await handleOrders(env, chatId, fromId, filter, null, ctxMsgId);
                     } else if (mode === "next") {
                         const cur = parts[3] || null;
-                        await handleOrders(env, chatId, fromId, filter, cur);
+                        await handleOrders(env, chatId, fromId, filter, cur, ctxMsgId);
                     }
                 } else if (data.startsWith("setrole:")) {
-                    const role = data.split(":")[1]; // "boy" | "girl"
+                    const role = data.split(":")[1];
                     const uDoc = await getUser(env, fromId);
                     const lang = fget(uDoc, "lang", "ru");
                     await setUser(env, fromId, { telegramId: fromId, role });
-                    await tgSendMessage(env, chatId, t(lang, "role_saved"));
+                    await uiText(env, chatId, fromId, t(lang, "role_saved"), undefined, lang, ctxMsgId);
                 } else if (data.startsWith("invite:")) {
-                    const type = data.split(":")[1]; // "partner" | "others"
+                    const type = data.split(":")[1];
                     const uDoc = await getUser(env, fromId);
                     const lang = fget(uDoc, "lang", "ru");
                     if (type === "partner") {
                         const pairCode = fget(uDoc, "pairCode", null);
-                        if (!pairCode) { await tgSendMessage(env, chatId, t(lang, "first_start_tip")); }
+                        if (!pairCode) { await uiText(env, chatId, fromId, t(lang, "first_start_tip"), undefined, lang, ctxMsgId); }
                         else {
                             const partnerLink = botDeepLink(env, `join-${pairCode}`);
-                            await tgSendMessage(env, chatId, `${t(lang, "invite_partner_message")} ${partnerLink}`);
+                            await uiText(env, chatId, fromId, `${t(lang, "invite_partner_message")} ${partnerLink}`, undefined, lang, ctxMsgId);
                         }
                     } else if (type === "others") {
                         const refLink = botDeepLink(env, `ref-${fromId}`);
-                        await tgSendMessage(env, chatId, `${t(lang, "invite_others_message")}\n\n${refLink}`);
+                        await uiText(env, chatId, fromId, `${t(lang, "invite_others_message")}\n\n${refLink}`, undefined, lang, ctxMsgId);
                     }
                 } else if (data.startsWith("orderview:")) {
                     const orderId = data.split(":")[1];
-                    await renderOrderCard(env, chatId, fromId, orderId);
+                    await renderOrderCard(env, chatId, fromId, orderId, ctxMsgId);
                 } else if (data.startsWith("orderstatus:")) {
-                    // orderstatus:<orderId>:<status>
                     const [, orderId, nextStatus] = data.split(":");
-                    await orderStatusPrompt(env, chatId, fromId, orderId, nextStatus);
+                    await orderStatusPrompt(env, chatId, fromId, orderId, nextStatus, ctxMsgId);
                 } else if (data === "pairdel:start") {
-                    await handlePairDeleteStart(env, chatId, fromId);
+                    await handlePairDeleteStart(env, chatId, fromId, ctxMsgId);
                 } else if (data === "pairdel:confirm") {
-                    await handlePairDeleteConfirm(env, chatId, fromId);
+                    await handlePairDeleteConfirm(env, chatId, fromId, ctxMsgId);
                 } else if (data === "pairdel:cancel") {
-                    await handlePairDeleteCancel(env, chatId, fromId);
+                    await handlePairDeleteCancel(env, chatId, fromId, ctxMsgId);
                 }
             }
 
