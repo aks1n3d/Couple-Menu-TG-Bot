@@ -392,8 +392,12 @@ async function fsCreate(env, collection, docId, fields) {
     return r.json();
 }
 async function fsPatch(env, path, fields) {
+    // Тоже MERGE c updateMask + защита exists=true
     const token = await gcpAccessToken(env);
-    const url = `https://firestore.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/databases/(default)/documents/${path}?currentDocument.exists=true`;
+    const base = `https://firestore.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/databases/(default)/documents/${path}`;
+    const maskParams = Object.keys(fields).map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&");
+    const url = `${base}?currentDocument.exists=true&${maskParams}`;
+
     const r = await fetch(url, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -402,12 +406,21 @@ async function fsPatch(env, path, fields) {
     return r.json();
 }
 async function fsSet(env, path, fields) {
+    // MERGE (partial update) через updateMask.fieldPaths, чтобы НЕ затирать другие поля
     const token = await gcpAccessToken(env);
-    const url = `https://firestore.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/databases/(default)/documents/${path}`;
+    const base = `https://firestore.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/databases/(default)/documents/${path}`;
+
+    // updateMask.fieldPaths передаётся как query-параметры
+    const maskParams = Object.keys(fields).map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&");
+    const url = `${base}?${maskParams}`;
+
     const r = await fetch(url, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ fields: mapFields(fields) })
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ fields: mapFields(fields) }),
     });
     return r.json();
 }
@@ -807,7 +820,7 @@ async function handleCreate(env, chatId, fromId, role, ctxMsgId=null) {
     await fsCreate(env, "pairs", code, {
         code,
         createdBy: fromId,
-        members: JSON.stringify([Number(fromId)]), // <— ЯВНО как число
+        members: JSON.stringify([Number(fromId)]),
         createdAt: Date.now()
     });
     await setUser(env, fromId, { telegramId: fromId, pairCode: code, role });
@@ -837,9 +850,11 @@ async function handleJoin(env, chatId, fromId, code, ctxMsgId=null) {
     let members = [];
     try { members = JSON.parse(fget(pair, "members", "[]")); } catch { members = []; }
     if (!isMember(members, fromId)) {
-        if (members.length >= 2) return uiText(env, chatId, fromId, `Эта пара уже заполнена двумя участниками.`, undefined, lang, ctxMsgId);
+        if (members.length >= 2) {
+            return uiText(env, chatId, fromId, `Эта пара уже заполнена двумя участниками.`, undefined, lang, ctxMsgId);
+        }
         members = addMemberSafe(members, fromId);
-        await fsSet(env, `pairs/${code}`, { members: JSON.stringify(members) });
+        await fsSet(env, `pairs/${code}`, { members: JSON.stringify(members) }); // теперь merge, не сотрёт другие поля!
     }
     await setUser(env, fromId, { telegramId: fromId, pairCode: code });
     await uiText(env, chatId, fromId, t(lang, "pair_join_ok", code), {
