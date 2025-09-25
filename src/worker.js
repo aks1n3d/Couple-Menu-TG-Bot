@@ -918,12 +918,25 @@ async function handleShowMenu(env, chatId, fromId, role, cursorStr=null, ctxMsgI
 }
 
 // ───────────────────────────────
-// Добавление позиции — только в своё меню (dialog flow)
+// Добавление позиции — persistent flow (через Firestore)
 // ───────────────────────────────
-const flows = new Map();
-function flowGet(uid){ return flows.get(uid); }
-function flowSet(uid,v){ flows.set(uid,v); }
-function flowClear(uid){ flows.delete(uid); }
+async function flowGet(env, uid) {
+    const u = await getUser(env, uid);
+    const stage = fget(u, "addFlowStage", 0);
+    const raw = fget(u, "addFlowDraft", "");
+    let draft = {};
+    if (raw) { try { draft = JSON.parse(raw); } catch { draft = {}; } }
+    return stage ? { stage, draft } : null;
+}
+async function flowSet(env, uid, v) {
+    await setUser(env, uid, {
+        addFlowStage: v.stage || 0,
+        addFlowDraft: v.draft ? JSON.stringify(v.draft) : ""
+    });
+}
+async function flowClear(env, uid) {
+    await setUser(env, uid, { addFlowStage: 0, addFlowDraft: "" });
+}
 
 async function handleAddItemStart(env, chatId, fromId, ctxMsgId=null) {
     const ok = await assertPairOrExplain(env, chatId, fromId, ctxMsgId);
@@ -936,11 +949,12 @@ async function handleAddItemStart(env, chatId, fromId, ctxMsgId=null) {
         await sendRoleChoice(env, chatId, fromId, lang, ctxMsgId);
         return;
     }
-    flowSet(fromId, { stage: 2, draft: { ownerRole: role } });
+    await flowSet(env, fromId, { stage: 2, draft: { ownerRole: role } });
     await uiText(env, chatId, fromId, t(lang, "add_flow_title"), undefined, lang, ctxMsgId);
 }
+
 async function handleFlowText(env, chatId, fromId, text) {
-    const s = flowGet(fromId);
+    const s = await flowGet(env, fromId);
     if (!s) {
         const used = await handleCommentFlowText(env, chatId, fromId, text);
         return used;
@@ -951,52 +965,54 @@ async function handleFlowText(env, chatId, fromId, text) {
 
     if (s.stage === 2) {
         s.draft.title = msg; s.stage = 3;
+        await flowSet(env, fromId, s);
         await uiText(env, chatId, fromId, t(lang, "add_flow_desc"), undefined, lang);
         return true;
     }
     if (s.stage === 3) {
         s.draft.description = msg; s.stage = 4;
+        await flowSet(env, fromId, s);
         await uiText(env, chatId, fromId, t(lang, "add_flow_price"), undefined, lang);
         return true;
     }
     if (s.stage === 4) {
         s.draft.priceLove = msg; s.stage = 5;
+        await flowSet(env, fromId, s);
         await uiText(env, chatId, fromId, t(lang, "add_flow_photo"), undefined, lang);
         return true;
     }
     return true;
 }
-async function handleFlowPhoto(env, chatId, fromId, fileId) {
-    const s = flowGet(fromId);
-    if (!s || s.stage !== 5) return false;
 
-    const ok = await assertPairOrExplain(env, chatId, fromId);
-    if (!ok) return true;
-    const uDoc = ok.userDoc;
-    if (!uDoc) { await uiText(env, chatId, fromId, I18N.ru.first_start_tip, undefined, "ru"); return true; }
-    const lang = fget(uDoc, "lang", "ru");
-    const role = fget(uDoc, "role", "");
-    if (!role) { await uiText(env, chatId, fromId, t(lang, "role_required"), undefined, lang); return true; }
-
-    if (s.draft.ownerRole !== role) {
-        await uiText(env, chatId, fromId, t(lang, "you_can_only_add_to_own"), undefined, lang);
-        s.draft.ownerRole = role;
+async function handleFlowText(env, chatId, fromId, text) {
+    const s = await flowGet(env, fromId);
+    if (!s) {
+        const used = await handleCommentFlowText(env, chatId, fromId, text);
+        return used;
     }
+    const uDoc = await getUser(env, fromId);
+    const lang = fget(uDoc, "lang", "ru");
+    const msg = (text || "").trim();
 
-    const pairCode = fget(uDoc, "pairCode", "");
-    const id = `${role === "boy" ? "B" : "G"}-${Date.now().toString().slice(-6)}`;
-
-    await fsCreate(env, "menuItems", id, {
-        id, pairCode,
-        ownerRole: s.draft.ownerRole,
-        title: s.draft.title,
-        description: s.draft.description,
-        priceLove: s.draft.priceLove,
-        photoFileId: fileId,
-        createdAt: Date.now()
-    });
-    await uiText(env, chatId, fromId, t(lang, "item_added", id), undefined, lang);
-    flowClear(fromId); return true;
+    if (s.stage === 2) {
+        s.draft.title = msg; s.stage = 3;
+        await flowSet(env, fromId, s);
+        await uiText(env, chatId, fromId, t(lang, "add_flow_desc"), undefined, lang);
+        return true;
+    }
+    if (s.stage === 3) {
+        s.draft.description = msg; s.stage = 4;
+        await flowSet(env, fromId, s);
+        await uiText(env, chatId, fromId, t(lang, "add_flow_price"), undefined, lang);
+        return true;
+    }
+    if (s.stage === 4) {
+        s.draft.priceLove = msg; s.stage = 5;
+        await flowSet(env, fromId, s);
+        await uiText(env, chatId, fromId, t(lang, "add_flow_photo"), undefined, lang);
+        return true;
+    }
+    return true;
 }
 
 // ───────────────────────────────
@@ -1089,13 +1105,25 @@ async function renderOrderCard(env, chatId, viewerId, orderId, ctxMsgId=null) {
 }
 
 // комментарии к смене статуса (flow)
-const commentFlows = new Map(); // key: userId -> { orderId, nextStatus, requireReason }
-function commentFlowSet(uid, v){ commentFlows.set(uid, v); }
-function commentFlowGet(uid){ return commentFlows.get(uid); }
-function commentFlowClear(uid){ commentFlows.delete(uid); }
+async function commentFlowSet(env, uid, v) {
+    await setUser(env, uid, { commentFlow: JSON.stringify(v || {}) });
+}
+async function commentFlowGet(env, uid) {
+    const u = await getUser(env, uid);
+    const raw = fget(u, "commentFlow", "");
+    if (!raw) return null;
+    try {
+        const obj = JSON.parse(raw);
+        if (obj && obj.orderId && obj.nextStatus) return obj;
+    } catch {}
+    return null;
+}
+async function commentFlowClear(env, uid) {
+    await setUser(env, uid, { commentFlow: "" });
+}
 
 async function handleCommentFlowText(env, chatId, fromId, text) {
-    const f = commentFlowGet(fromId);
+    const f = await commentFlowGet(env, fromId);
     if (!f) return false;
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc,"lang","ru");
@@ -1107,17 +1135,18 @@ async function handleCommentFlowText(env, chatId, fromId, text) {
     }
     const comment = (msg === "-" ? "" : msg);
     await updateOrderStatus(env, chatId, fromId, f.orderId, f.nextStatus, comment);
-    commentFlowClear(fromId);
+    await commentFlowClear(env, fromId);
     return true;
 }
+
 async function orderStatusPrompt(env, chatId, fromId, orderId, nextStatus, ctxMsgId=null) {
     const uDoc = await getUser(env, fromId);
     const lang = fget(uDoc,"lang","ru");
     if (nextStatus === "rejected") {
-        commentFlowSet(fromId, { orderId, nextStatus, requireReason: true });
+        await commentFlowSet(env, fromId, { orderId, nextStatus, requireReason: true });
         await uiText(env, chatId, fromId, t(lang,"enter_reason_reject"), undefined, lang, ctxMsgId);
     } else {
-        commentFlowSet(fromId, { orderId, nextStatus, requireReason: false });
+        await commentFlowSet(env, fromId, { orderId, nextStatus, requireReason: false });
         await uiText(env, chatId, fromId, t(lang,"enter_comment_optional"), undefined, lang, ctxMsgId);
     }
 }
